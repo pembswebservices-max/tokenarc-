@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import asyncio
+import time
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -132,15 +134,24 @@ def init_bot_sync():
 async def set_webhook_async():
     global bot_app
     try:
-        logger.info(f"Setting webhook to {WEBHOOK_URL}/webhook")
-        await bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-        logger.info(f"✅ Webhook set")
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        logger.info(f"🔗 Setting webhook to {webhook_url}")
+        result = await bot_app.bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook set result: {result}")
+        
+        # Verify webhook
+        info = await bot_app.bot.get_webhook_info()
+        logger.info(f"✅ Webhook info: {info}")
+        
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}", exc_info=True)
 
 def set_webhook_sync():
     global loop
-    loop.run_until_complete(set_webhook_async())
+    try:
+        loop.run_until_complete(set_webhook_async())
+    except Exception as e:
+        logger.error(f"❌ Error setting webhook: {e}", exc_info=True)
 
 # ===================== FLASK =====================
 
@@ -155,7 +166,7 @@ def webhook():
     global bot_app, loop
     
     logger.info("=" * 80)
-    logger.info("🔔 WEBHOOK RECEIVED")
+    logger.info("🔔 WEBHOOK RECEIVED - Message from Telegram")
     
     try:
         if bot_app is None:
@@ -163,7 +174,7 @@ def webhook():
             return 'Bot not ready', 503
         
         data = request.get_json()
-        logger.info(f"📨 Raw data: {data}")
+        logger.info(f"📨 Raw data received: {data}")
         
         if not data:
             logger.warning("⚠️  Empty JSON")
@@ -172,9 +183,11 @@ def webhook():
         from telegram import Update
         update = Update.de_json(data, bot_app.bot)
         logger.info(f"✅ Update object created: {update}")
-        logger.info(f"   - update_id: {update.update_id}")
-        logger.info(f"   - message: {update.message}")
-        logger.info(f"   - callback_query: {update.callback_query}")
+        
+        if update.message:
+            logger.info(f"📝 Message type: {update.message.text}")
+        if update.callback_query:
+            logger.info(f"🔘 Callback type: {update.callback_query.data}")
         
         if not update:
             logger.warning("⚠️  Update is None")
@@ -182,7 +195,7 @@ def webhook():
         
         logger.info(f"🔄 Processing update...")
         loop.run_until_complete(bot_app.process_update(update))
-        logger.info(f"✅ Update processed!")
+        logger.info(f"✅ Update processed successfully!")
         
         return '', 204
     
@@ -209,10 +222,21 @@ if __name__ == '__main__':
     logger.info("\n🔧 Initializing bot...")
     init_bot_sync()
     
-    logger.info("\n🔗 Setting webhook...")
-    set_webhook_sync()
-    
+    # Start Flask in background
     logger.info(f"\n🌍 Starting Flask on 0.0.0.0:{PORT}")
+    logger.info("⏳ Waiting 3 seconds for Flask to start listening...")
+    
+    # Thread to set webhook after Flask is ready
+    def delayed_webhook_setup():
+        time.sleep(3)  # Wait for Flask to start
+        logger.info("\n🔗 Flask is ready, now setting webhook...")
+        set_webhook_sync()
+    
+    webhook_thread = threading.Thread(target=delayed_webhook_setup, daemon=True)
+    webhook_thread.start()
+    
+    # Run Flask (blocking)
+    logger.info("\n▶️  Flask starting...")
     flask_app.run(
         host='0.0.0.0',
         port=PORT,
