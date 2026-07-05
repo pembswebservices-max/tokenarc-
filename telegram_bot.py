@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import time
-import threading
+import requests
 from datetime import datetime
 from typing import Optional
 
@@ -33,6 +33,7 @@ logger.info(f"✅ Bot configured - Token: {TOKEN[:20]}... - Webhook: {WEBHOOK_UR
 flask_app = Flask(__name__)
 bot_app: Optional[Application] = None
 loop: Optional[asyncio.AbstractEventLoop] = None
+FLASK_READY = False
 
 # ===================== SIMPLE STORAGE =====================
 def load_users():
@@ -114,7 +115,6 @@ async def init_bot() -> Application:
     bot_app = Application.builder().token(TOKEN).build()
     logger.info(f"✅ Application created")
     
-    # Add handlers
     bot_app.add_handler(CommandHandler("start", start))
     logger.info(f"✅ CommandHandler for /start added")
     
@@ -129,7 +129,6 @@ def init_bot_sync():
     if bot_app is None:
         logger.info("Running async init...")
         bot_app = loop.run_until_complete(init_bot())
-        logger.info(f"✅ Bot app: {bot_app}")
 
 async def set_webhook_async():
     global bot_app
@@ -137,9 +136,8 @@ async def set_webhook_async():
         webhook_url = f"{WEBHOOK_URL}/webhook"
         logger.info(f"🔗 Setting webhook to {webhook_url}")
         result = await bot_app.bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook set result: {result}")
+        logger.info(f"✅ Webhook set: {result}")
         
-        # Verify webhook
         info = await bot_app.bot.get_webhook_info()
         logger.info(f"✅ Webhook info: {info}")
         
@@ -155,10 +153,10 @@ def set_webhook_sync():
 
 # ===================== FLASK =====================
 
-@flask_app.route('/', methods=['GET'])
+@flask_app.route('/', methods=['GET', 'HEAD'])
 def index():
-    logger.info("📍 GET / - Health check")
-    return '✅ Bot Running', 200
+    logger.debug("📍 GET / - Health check")
+    return '✅ Bot Ready', 200
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
@@ -166,7 +164,7 @@ def webhook():
     global bot_app, loop
     
     logger.info("=" * 80)
-    logger.info("🔔 WEBHOOK RECEIVED - Message from Telegram")
+    logger.info("🔔 WEBHOOK RECEIVED")
     
     try:
         if bot_app is None:
@@ -174,7 +172,7 @@ def webhook():
             return 'Bot not ready', 503
         
         data = request.get_json()
-        logger.info(f"📨 Raw data received: {data}")
+        logger.info(f"📨 Data received: {json.dumps(data)[:100]}...")
         
         if not data:
             logger.warning("⚠️  Empty JSON")
@@ -182,12 +180,6 @@ def webhook():
         
         from telegram import Update
         update = Update.de_json(data, bot_app.bot)
-        logger.info(f"✅ Update object created: {update}")
-        
-        if update.message:
-            logger.info(f"📝 Message type: {update.message.text}")
-        if update.callback_query:
-            logger.info(f"🔘 Callback type: {update.callback_query.data}")
         
         if not update:
             logger.warning("⚠️  Update is None")
@@ -195,7 +187,7 @@ def webhook():
         
         logger.info(f"🔄 Processing update...")
         loop.run_until_complete(bot_app.process_update(update))
-        logger.info(f"✅ Update processed successfully!")
+        logger.info(f"✅ Update processed!")
         
         return '', 204
     
@@ -222,21 +214,39 @@ if __name__ == '__main__':
     logger.info("\n🔧 Initializing bot...")
     init_bot_sync()
     
-    # Start Flask in background
     logger.info(f"\n🌍 Starting Flask on 0.0.0.0:{PORT}")
-    logger.info("⏳ Waiting 3 seconds for Flask to start listening...")
+    logger.info("⏳ Starting Flask server...")
     
-    # Thread to set webhook after Flask is ready
-    def delayed_webhook_setup():
-        time.sleep(3)  # Wait for Flask to start
-        logger.info("\n🔗 Flask is ready, now setting webhook...")
-        set_webhook_sync()
+    # Import threading AFTER app is created
+    import threading
     
-    webhook_thread = threading.Thread(target=delayed_webhook_setup, daemon=True)
+    def wait_and_set_webhook():
+        """Wait for Flask to be ready, then set webhook"""
+        logger.info("⏳ Waiting for Flask to be ready (checking endpoint)...")
+        
+        # Wait up to 30 seconds for Flask to be ready
+        for attempt in range(30):
+            try:
+                # Try to reach the health check endpoint
+                response = requests.get(f"http://localhost:{PORT}/", timeout=2)
+                if response.status_code == 200:
+                    logger.info(f"✅ Flask is ready! (attempt {attempt + 1})")
+                    time.sleep(2)  # Extra safety wait
+                    logger.info("\n🔗 Now setting webhook...")
+                    set_webhook_sync()
+                    return
+            except Exception as e:
+                logger.debug(f"Flask not ready yet ({attempt + 1}/30): {e}")
+                time.sleep(1)
+        
+        logger.error("❌ Flask didn't start in time!")
+    
+    # Start webhook setup in background
+    webhook_thread = threading.Thread(target=wait_and_set_webhook, daemon=True)
     webhook_thread.start()
     
     # Run Flask (blocking)
-    logger.info("\n▶️  Flask starting...")
+    logger.info("▶️  Flask running...\n")
     flask_app.run(
         host='0.0.0.0',
         port=PORT,
