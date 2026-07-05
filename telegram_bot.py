@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import time
+import threading
 import requests
 from datetime import datetime
 from typing import Optional
@@ -13,27 +14,30 @@ from flask import Flask, request
 
 # ===================== LOGGING =====================
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 # ===================== CONFIG =====================
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '').strip()
 PORT = int(os.getenv('PORT', 8000))
 DATA_FILE = 'arcade_users.json'
 
 if not TOKEN or not WEBHOOK_URL:
     raise ValueError("❌ Missing TELEGRAM_TOKEN or WEBHOOK_URL")
 
-logger.info(f"✅ Bot configured - Token: {TOKEN[:20]}... - Webhook: {WEBHOOK_URL}")
+logger.info(f"✅ Bot configured - Webhook: {WEBHOOK_URL}")
 
 # ===================== FLASK =====================
 flask_app = Flask(__name__)
 bot_app: Optional[Application] = None
 loop: Optional[asyncio.AbstractEventLoop] = None
-FLASK_READY = False
+loop_lock = threading.Lock()
 
 # ===================== SIMPLE STORAGE =====================
 def load_users():
@@ -69,10 +73,9 @@ def get_user(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start command"""
     try:
-        logger.info(f"🎯 START HANDLER CALLED - User: {update.effective_user.first_name} ({update.effective_user.id})")
+        logger.info(f"🎯 /start from {update.effective_user.first_name} ({update.effective_user.id})")
         
         user = get_user(update.effective_user.id)
-        logger.info(f"✅ User loaded: {user}")
         
         keyboard = [
             [InlineKeyboardButton("🎮 Play", callback_data='play')],
@@ -81,7 +84,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        logger.info(f"📤 Sending reply...")
         await update.message.reply_text(
             f"🎰 *TokenArcade*\n\n"
             f"Hello {update.effective_user.first_name}!\n"
@@ -89,14 +91,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
-        logger.info(f"✅ Reply sent!")
+        logger.info(f"✅ Reply sent to {update.effective_user.first_name}!")
         
     except Exception as e:
         logger.error(f"❌ Error in start handler: {e}", exc_info=True)
-        try:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        except:
-            pass
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Button handler"""
@@ -113,90 +111,77 @@ async def init_bot() -> Application:
     logger.info("🔧 Initializing application...")
     
     bot_app = Application.builder().token(TOKEN).build()
-    logger.info(f"✅ Application created")
-    
     bot_app.add_handler(CommandHandler("start", start))
-    logger.info(f"✅ CommandHandler for /start added")
-    
     bot_app.add_handler(CallbackQueryHandler(button))
-    logger.info(f"✅ CallbackQueryHandler added")
     
-    logger.info("✅ All handlers registered")
+    await bot_app.initialize()
+    
+    logger.info("✅ Bot initialized and ready")
     return bot_app
 
 def init_bot_sync():
     global bot_app, loop
     if bot_app is None:
-        logger.info("Running async init...")
         bot_app = loop.run_until_complete(init_bot())
 
-async def set_webhook_async():
+async def setup_webhook_async():
     global bot_app
     try:
         webhook_url = f"{WEBHOOK_URL}/webhook"
+        logger.info(f"🔗 Clearing old webhook + pending updates...")
+        await bot_app.bot.delete_webhook(drop_pending_updates=True)
+        
         logger.info(f"🔗 Setting webhook to {webhook_url}")
         result = await bot_app.bot.set_webhook(url=webhook_url)
         logger.info(f"✅ Webhook set: {result}")
         
         info = await bot_app.bot.get_webhook_info()
-        logger.info(f"✅ Webhook info: {info}")
+        logger.info(f"✅ Webhook confirmed: url={info.url}, pending={info.pending_update_count}")
         
     except Exception as e:
-        logger.error(f"❌ Webhook error: {e}", exc_info=True)
+        logger.error(f"❌ Webhook setup error: {e}", exc_info=True)
 
-def set_webhook_sync():
+def setup_webhook_sync():
     global loop
-    try:
-        loop.run_until_complete(set_webhook_async())
-    except Exception as e:
-        logger.error(f"❌ Error setting webhook: {e}", exc_info=True)
+    loop.run_until_complete(setup_webhook_async())
 
 # ===================== FLASK =====================
 
 @flask_app.route('/', methods=['GET', 'HEAD'])
 def index():
-    logger.debug("📍 GET / - Health check")
     return '✅ Bot Ready', 200
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
-    """Webhook endpoint"""
+    """Webhook endpoint - thread-safe using lock"""
     global bot_app, loop
-    
-    logger.info("=" * 80)
-    logger.info("🔔 WEBHOOK RECEIVED")
     
     try:
         if bot_app is None:
             logger.error("❌ bot_app is None!")
             return 'Bot not ready', 503
         
-        data = request.get_json()
-        logger.info(f"📨 Data received: {json.dumps(data)[:100]}...")
+        data = request.get_json(force=True, silent=True)
         
         if not data:
-            logger.warning("⚠️  Empty JSON")
             return '', 204
         
-        from telegram import Update
         update = Update.de_json(data, bot_app.bot)
         
         if not update:
-            logger.warning("⚠️  Update is None")
             return '', 204
         
-        logger.info(f"🔄 Processing update...")
-        loop.run_until_complete(bot_app.process_update(update))
-        logger.info(f"✅ Update processed!")
+        logger.info(f"🔔 Incoming update {update.update_id}")
         
-        return '', 204
+        with loop_lock:
+            loop.run_until_complete(bot_app.process_update(update))
+        
+        logger.info(f"✅ Update {update.update_id} processed")
+        return '', 200
     
     except Exception as e:
         logger.error(f"❌ WEBHOOK ERROR: {e}", exc_info=True)
-        return '', 500
-    
-    finally:
-        logger.info("=" * 80)
+        return '', 200
 
 # ===================== MAIN =====================
 
@@ -204,53 +189,32 @@ if __name__ == '__main__':
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    logger.info("=" * 80)
-    logger.info("🚀 STARTING TOKENARCADE BOT")
-    logger.info("=" * 80)
-    logger.info(f"Token: {TOKEN[:20]}...")
-    logger.info(f"Webhook URL: {WEBHOOK_URL}/webhook")
-    logger.info(f"Port: {PORT}")
+    logger.info("🚀 Starting TokenArcade Bot")
     
-    logger.info("\n🔧 Initializing bot...")
     init_bot_sync()
     
-    logger.info(f"\n🌍 Starting Flask on 0.0.0.0:{PORT}")
-    logger.info("⏳ Starting Flask server...")
-    
-    # Import threading AFTER app is created
-    import threading
-    
-    def wait_and_set_webhook():
-        """Wait for Flask to be ready, then set webhook"""
-        logger.info("⏳ Waiting for Flask to be ready (checking endpoint)...")
-        
-        # Wait up to 30 seconds for Flask to be ready
+    def wait_and_setup_webhook():
+        logger.info("⏳ Waiting for Flask to be ready...")
         for attempt in range(30):
             try:
-                # Try to reach the health check endpoint
                 response = requests.get(f"http://localhost:{PORT}/", timeout=2)
                 if response.status_code == 200:
-                    logger.info(f"✅ Flask is ready! (attempt {attempt + 1})")
-                    time.sleep(2)  # Extra safety wait
-                    logger.info("\n🔗 Now setting webhook...")
-                    set_webhook_sync()
+                    logger.info(f"✅ Flask ready (attempt {attempt + 1})")
+                    time.sleep(1)
+                    setup_webhook_sync()
                     return
-            except Exception as e:
-                logger.debug(f"Flask not ready yet ({attempt + 1}/30): {e}")
+            except Exception:
                 time.sleep(1)
-        
         logger.error("❌ Flask didn't start in time!")
     
-    # Start webhook setup in background
-    webhook_thread = threading.Thread(target=wait_and_set_webhook, daemon=True)
+    webhook_thread = threading.Thread(target=wait_and_setup_webhook, daemon=True)
     webhook_thread.start()
     
-    # Run Flask (blocking)
-    logger.info("▶️  Flask running...\n")
+    logger.info(f"🌍 Flask starting on 0.0.0.0:{PORT}")
     flask_app.run(
         host='0.0.0.0',
         port=PORT,
         debug=False,
         use_reloader=False,
-        threaded=True
+        threaded=False
     )
