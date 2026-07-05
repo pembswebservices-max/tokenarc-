@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', 8000))
-ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]  # Add admin IDs as env var
+ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
 DATA_FILE = 'arcade_users.json'
 
 if not TOKEN or not WEBHOOK_URL:
@@ -53,11 +53,11 @@ class GameType(str, Enum):
     SLOTS = "slots"
 
 class VIPLevel(int, Enum):
-    BRONZE = 0      # 0 XP
-    SILVER = 1      # 1000 XP
-    GOLD = 2        # 5000 XP
-    PLATINUM = 3    # 15000 XP
-    DIAMOND = 4     # 50000 XP
+    BRONZE = 0
+    SILVER = 1
+    GOLD = 2
+    PLATINUM = 3
+    DIAMOND = 4
 
 VIP_NAMES = {
     VIPLevel.BRONZE: "Bronze",
@@ -77,10 +77,10 @@ VIP_MULTIPLIERS = {
 
 VIP_RAKEBACK = {
     VIPLevel.BRONZE: 0,
-    VIPLevel.SILVER: 0.01,      # 1%
-    VIPLevel.GOLD: 0.02,         # 2%
-    VIPLevel.PLATINUM: 0.03,     # 3%
-    VIPLevel.DIAMOND: 0.05       # 5%
+    VIPLevel.SILVER: 0.01,
+    VIPLevel.GOLD: 0.02,
+    VIPLevel.PLATINUM: 0.03,
+    VIPLevel.DIAMOND: 0.05
 }
 
 # ===================== STORAGE =====================
@@ -109,7 +109,7 @@ class UserManager:
         if uid not in users:
             users[uid] = {
                 'username': '',
-                'coins': 1000,  # Starting balance
+                'coins': 1000,
                 'xp': 0,
                 'level': 1,
                 'vip': 0,
@@ -158,7 +158,6 @@ class UserManager:
 class GameEngine:
     @staticmethod
     def mines(bet: int, bombs: int) -> tuple[bool, int]:
-        """Mines game: returns (won, payout)"""
         if bombs not in [3, 5, 10]:
             return False, 0
         
@@ -166,7 +165,7 @@ class GameEngine:
         mult = 1.0
         for i in range(safe_tiles):
             mult *= (25 - i) / (25 - i - bombs)
-        mult *= 0.95  # House edge
+        mult *= 0.95
         
         hit_bomb = random.random() < (safe_tiles / (25 - bombs))
         
@@ -178,7 +177,6 @@ class GameEngine:
 
     @staticmethod
     def keno(bet: int, picks: int = 5) -> tuple[bool, int]:
-        """Keno game"""
         drawn = set()
         while len(drawn) < 10:
             drawn.add(random.randint(1, 40))
@@ -186,7 +184,6 @@ class GameEngine:
         player_picks = set(random.sample(range(1, 41), min(picks, 10)))
         matches = len(player_picks & drawn)
         
-        # Simple payout table
         payout_table = {
             3: [0, 0, 1, 5],
             4: [0, 0, 0, 1.5, 4],
@@ -200,7 +197,6 @@ class GameEngine:
 
     @staticmethod
     def slots(bet: int) -> tuple[bool, int]:
-        """Slot machine"""
         symbols = ['🍒', '🍋', '🍊', '🔔', '💎', '7️⃣']
         reels = [random.choice(symbols) for _ in range(3)]
         
@@ -220,26 +216,23 @@ class GameEngine:
 
     @staticmethod
     def coinflip(bet: int) -> tuple[bool, int]:
-        """Coinflip: 50/50 double or nothing"""
         won = random.choice([True, False])
         payout = bet * 2 if won else 0
         return won, payout
 
     @staticmethod
     def crash(bet: int) -> tuple[bool, int]:
-        """Crash game: random multiplier"""
         mult = round(random.uniform(1.0, 10.0), 2)
         crash_point = round(random.uniform(1.1, 5.0), 2)
         
         if mult > crash_point:
-            return False, 0  # Crashed before you cashed out
+            return False, 0
         else:
             payout = int(bet * mult)
             return True, payout, mult, crash_point
 
     @staticmethod
     def dice_roll(bet: int, prediction: str) -> tuple[bool, int]:
-        """Dice: predict high or low"""
         d1, d2 = random.randint(1, 6), random.randint(1, 6)
         total = d1 + d2
         
@@ -253,11 +246,13 @@ class GameEngine:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start command"""
+    logger.info(f"🎮 START handler called for {update.effective_user.first_name}")
     users = UserManager.load_users()
     user = UserManager.get_or_create(update.effective_user.id, users)
     user['username'] = update.effective_user.first_name or 'Player'
     user['last_active'] = datetime.now().isoformat()
     UserManager.save_users(users)
+    logger.info(f"✅ User loaded: {user['username']}")
     
     keyboard = [
         [InlineKeyboardButton("🎮 Play Games", callback_data='games_menu')],
@@ -361,7 +356,6 @@ async def mines_play(update: Update, context: ContextTypes.DEFAULT_TYPE, bet: in
     user['xp'] += int(bet / 10)
     user['stats']['game_history']['mines'] = user['stats']['game_history'].get('mines', 0) + 1
     
-    # VIP rakeback
     vip = UserManager.get_vip_level(user['xp'])
     rakeback = int(bet * VIP_RAKEBACK[vip])
     if rakeback > 0:
@@ -710,17 +704,29 @@ def webhook():
     
     try:
         if bot_app is None:
+            logger.error("❌ Bot not initialized!")
             return 'Bot not ready', 503
         
         data = request.get_json()
+        logger.info(f"📨 Webhook received: {data}")
+        
         if not data:
+            logger.warning("⚠️  Empty request body")
             return '', 204
         
         update = Update.de_json(data, bot_app.bot)
         if not update:
+            logger.warning("⚠️  Failed to parse update")
             return '', 204
         
+        logger.info(f"✅ Update parsed - Type: {update.update_id}")
+        if update.message:
+            logger.info(f"📝 Message: {update.message.text} from {update.message.from_user.first_name}")
+        if update.callback_query:
+            logger.info(f"🔘 Callback: {update.callback_query.data}")
+        
         loop.run_until_complete(bot_app.process_update(update))
+        logger.info(f"✅ Update processed")
         return '', 204
     
     except Exception as e:
